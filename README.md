@@ -4,6 +4,10 @@ This local browser form sends one read-only SNMPv3 GET for
 **sysUpTime.0** (1.3.6.1.2.1.1.3.0) from **your computer** to the device
 you enter. It does not change device or network-management configuration.
 
+![Local SNMPv3 probe form with example device and username](docs/images/snmpv3-probe-form.png)
+
+*Example fields only. No passphrases or live device details are shown.*
+
 ## Start
 
 Double-click [Run SNMPv3 Probe.command](Run%20SNMPv3%20Probe.command) in Finder,
