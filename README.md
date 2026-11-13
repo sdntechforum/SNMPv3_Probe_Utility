@@ -1,8 +1,9 @@
 # Local SNMPv3 Read Test
 
-This local browser form sends one read-only SNMPv3 GET for
-**sysUpTime.0** (1.3.6.1.2.1.1.3.0) from **your computer** to the device
-you enter. It does not change device or network-management configuration.
+This local browser form sends one read-only SNMPv3 GET from **your computer**
+to the device you enter. The default profile requests **sysUpTime.0**
+(1.3.6.1.2.1.1.3.0). It does not change device or network-management
+configuration.
 
 ![Local SNMPv3 probe form with example device and username](docs/images/snmpv3-probe-form.png)
 
@@ -22,6 +23,10 @@ and privacy passphrases, and the matching protocols. Defaults are **SHA256**
 and **Cisco/Reeder AES256**; change them to match your device. The form also offers
 SHA1, AES128, and Blumenthal AES256 for devices configured differently. The
 default UDP port is 161; the default timeout is five seconds with no retries.
+Choose **Uptime only** or **Basic diagnostics**. Basic diagnostics requests
+sysUpTime.0, sysDescr.0, sysObjectID.0, and snmpEngineID.0 in one GET and shows
+each result separately. An unavailable object may be unsupported or outside the
+device's SNMP view; it does not by itself mean authentication failed.
 After each result, the device and username remain in the form for another
 test. The passphrase fields are blank.
 
@@ -42,10 +47,10 @@ The local checks do not contact an SNMP device:
 
 ## Reading results
 
-- **Authenticated read succeeded** means this Mac received an SNMPv3 reply
-  containing sysUpTime.0 with the entered username and protocols.
+- **Authenticated read succeeded** means this computer received every value
+  requested by the selected profile.
 - **Authenticated SNMP reply received** with an error or unavailable OID
-  means the device replied, but the requested value was not returned.
+  means the device replied, but one or more requested values were not returned.
 - **WrongDigest**, unknown username, or a privacy error identifies the
   protocol stage reported by PySNMP; it does not by itself establish why the
   device and manager disagree.

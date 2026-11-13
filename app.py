@@ -29,6 +29,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     get_cmd,
 )
 from pysnmp.proto import errind
+from pysnmp.proto.rfc1902 import OctetString
 from pysnmp.proto.rfc1905 import NoSuchInstance, NoSuchObject
 
 
@@ -53,6 +54,21 @@ class Profile:
     auth_protocol: str = "SHA256"
     priv_protocol: str = "CISCO_AES256"
     timeout: int = 5
+    read_profile: str = "UPTIME"
+
+
+@dataclass(frozen=True)
+class ReadObject:
+    name: str
+    oid: str
+
+
+@dataclass(frozen=True)
+class ReadValue:
+    name: str
+    oid: str
+    status: str
+    value: str
 
 
 @dataclass(frozen=True)
@@ -60,6 +76,21 @@ class Outcome:
     kind: str
     title: str
     detail: str
+    readings: tuple[ReadValue, ...] = ()
+
+
+READ_PROFILES = {
+    "UPTIME": ("Uptime only", (ReadObject("sysUpTime.0", UPTIME_OID),)),
+    "BASIC": (
+        "Basic diagnostics (4 objects)",
+        (
+            ReadObject("sysUpTime.0", UPTIME_OID),
+            ReadObject("sysDescr.0", "1.3.6.1.2.1.1.1.0"),
+            ReadObject("sysObjectID.0", "1.3.6.1.2.1.1.2.0"),
+            ReadObject("snmpEngineID.0", "1.3.6.1.6.3.10.2.1.1.0"),
+        ),
+    ),
+}
 
 
 def _valid_device(device: str) -> bool:
@@ -86,7 +117,7 @@ def parse_submission(body: bytes, csrf_token: str) -> tuple[Profile, str, str]:
             body.decode("utf-8"),
             keep_blank_values=True,
             strict_parsing=True,
-            max_num_fields=9,
+            max_num_fields=10,
         )
     except (UnicodeDecodeError, ValueError) as exc:
         raise ValueError("The submitted form could not be read.") from exc
@@ -118,14 +149,17 @@ def parse_submission(body: bytes, csrf_token: str) -> tuple[Profile, str, str]:
         raise ValueError("Port must be 1–65535 and timeout must be 1–15 seconds.")
     auth_protocol = one("auth_protocol")
     priv_protocol = one("priv_protocol")
+    read_profile = one("read_profile")
     if auth_protocol not in AUTH_PROTOCOLS or priv_protocol not in PRIV_PROTOCOLS:
         raise ValueError("Select a supported authentication and privacy protocol.")
+    if read_profile not in READ_PROFILES:
+        raise ValueError("Select a supported read profile.")
     auth_password = one("auth_password")
     priv_password = one("priv_password")
     if not all(8 <= len(value.encode("utf-8")) <= 255 for value in (auth_password, priv_password)):
         raise ValueError("Each passphrase must be 8–255 bytes.")
     return (
-        Profile(device, port, username, auth_protocol, priv_protocol, timeout),
+        Profile(device, port, username, auth_protocol, priv_protocol, timeout, read_profile),
         auth_password,
         priv_password,
     )
@@ -149,7 +183,10 @@ async def _snmp_get(profile: Profile, auth_password: str, priv_password: str):
             ),
             target,
             ContextData(),
-            ObjectType(ObjectIdentity(UPTIME_OID)),
+            *(
+                ObjectType(ObjectIdentity(item.oid))
+                for item in READ_PROFILES[profile.read_profile][1]
+            ),
             lookupMib=False,
         )
 
@@ -162,7 +199,8 @@ async def _snmp_get(profile: Profile, auth_password: str, priv_password: str):
         engine.close_dispatcher()
 
 
-def classify_reply(indication, status, index, bindings) -> Outcome:
+def classify_reply(indication, status, index, bindings, read_profile="UPTIME") -> Outcome:
+    requested = READ_PROFILES[read_profile][1]
     if isinstance(indication, errind.RequestTimedOut):
         return Outcome(
             "inconclusive",
@@ -202,39 +240,79 @@ def classify_reply(indication, status, index, bindings) -> Outcome:
             "PySNMP reported " + type(indication).__name__ + ".",
         )
     if status:
+        index_number = int(index)
+        target = (
+            f" ({requested[index_number - 1].name})"
+            if 1 <= index_number <= len(requested)
+            else ""
+        )
+        status_text = status.prettyPrint() if hasattr(status, "prettyPrint") else str(status)
         return Outcome(
             "response",
             "Authenticated SNMP reply received",
             "The device returned SNMP error status "
-            + status.prettyPrint()
+            + status_text
             + " at index "
-            + str(int(index))
+            + str(index_number)
+            + target
             + ".",
         )
-    if not bindings:
+    if len(bindings) != len(requested):
         return Outcome(
             "inconclusive",
-            "No requested value returned",
-            "The SNMP exchange completed without a value for sysUpTime.0.",
+            "Incomplete SNMP reply",
+            f"Expected {len(requested)} requested values; received {len(bindings)}.",
         )
-    value = bindings[0][1]
-    if isinstance(value, (NoSuchObject, NoSuchInstance)):
+    readings = []
+    available = 0
+    for position, (item, binding) in enumerate(zip(requested, bindings), start=1):
+        if str(binding[0]) != item.oid:
+            return Outcome(
+                "inconclusive",
+                "Unexpected SNMP reply",
+                f"Returned OID at position {position} did not match {item.name}.",
+            )
+        value = binding[1]
+        if isinstance(value, (NoSuchObject, NoSuchInstance)):
+            readings.append(
+                ReadValue(
+                    item.name,
+                    item.oid,
+                    "unavailable",
+                    "Unavailable (unsupported or outside this SNMP view)",
+                )
+            )
+            continue
+        if item.name == "snmpEngineID.0" and isinstance(value, OctetString):
+            display = "0x" + value.asOctets().hex().upper()
+        else:
+            display = value.prettyPrint() if hasattr(value, "prettyPrint") else str(value)
+        if len(display) > 300:
+            display = display[:300] + "…"
+        readings.append(ReadValue(item.name, item.oid, "value", display))
+        available += 1
+    if available == len(requested):
+        noun = "value" if available == 1 else "values"
         return Outcome(
-            "response",
-            "Authenticated SNMP reply received",
-            "The device replied, but sysUpTime.0 is unavailable in this SNMP view.",
+            "success",
+            "Authenticated read succeeded",
+            f"Received all {available} requested {noun}.",
+            tuple(readings),
         )
     return Outcome(
-        "success",
-        "Authenticated read succeeded",
-        "sysUpTime.0 = " + value.prettyPrint()[:300],
+        "response",
+        "Authenticated SNMP reply received",
+        f"Received {available} of {len(requested)} requested values; unavailable objects "
+        "may be unsupported or outside this SNMP view.",
+        tuple(readings),
     )
 
 
 def run_probe(profile: Profile, auth_password: str, priv_password: str) -> Outcome:
     try:
         return classify_reply(
-            *asyncio.run(_snmp_get(profile, auth_password, priv_password))
+            *asyncio.run(_snmp_get(profile, auth_password, priv_password)),
+            read_profile=profile.read_profile,
         )
     except (TimeoutError, asyncio.TimeoutError):
         return Outcome(
@@ -285,7 +363,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Pragma", "no-cache")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", "same-origin")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header(
@@ -302,8 +380,24 @@ class ProbeHandler(BaseHTTPRequestHandler):
         if outcome:
             result = (
                 f'<section class="result {escape(outcome.kind)}" role="status">'
-                f"<h2>{escape(outcome.title)}</h2><p>{escape(outcome.detail)}</p></section>"
+                f"<h2>{escape(outcome.title)}</h2><p>{escape(outcome.detail)}</p>"
             )
+            if outcome.readings:
+                rows = "".join(
+                    "<tr><th scope=\"row\">"
+                    + escape(item.name)
+                    + "<br><code>"
+                    + escape(item.oid)
+                    + "</code></th><td>"
+                    + escape(item.value)
+                    + "</td></tr>"
+                    for item in outcome.readings
+                )
+                result += (
+                    '<table class="readings"><thead><tr><th>Object</th><th>Result</th>'
+                    "</tr></thead><tbody>" + rows + "</tbody></table>"
+                )
+            result += "</section>"
 
         def options(choices, selected):
             return "".join(
@@ -334,15 +428,21 @@ small, .hint {{ color: #425466; }} .result {{ padding: .8rem 1rem; border-radius
 .result.success, .result.response {{ background: #e4f5e9; }}
 .result.failure {{ background: #fde8e7; }}
 .result.inconclusive {{ background: #fff2d8; }}
+.readings {{ width: 100%; border-collapse: collapse; text-align: left; }}
+.readings th, .readings td {{ padding: .55rem; border-top: 1px solid #b5c7d7;
+  vertical-align: top; overflow-wrap: anywhere; }}
+.readings code {{ font-size: .8rem; font-weight: normal; }}
 @media (max-width: 640px) {{ .grid {{ grid-template-columns: 1fr; }} }}
 </style></head><body><main>
 <h1>SNMPv3 credential read test</h1>
-<p class="hint">Runs one read-only GET for sysUpTime.0 from this computer. It does not
+<p class="hint">Runs one read-only SNMPv3 GET for the selected profile from this computer. It does not
 change the device. A timeout is inconclusive because this computer may have different
 network access than your management system.</p>
 {result}
 <form method="post" action="{self.server.session_path}/probe" autocomplete="off">
 <input type="hidden" name="csrf" value="{self.server.csrf_token}">
+<label>Read profile
+<select name="read_profile">{options(READ_PROFILES, profile.read_profile)}</select></label>
 <div class="grid">
 <label>Device IPv4 address or hostname
 <input name="device" value="{escape(profile.device, quote=True)}" required autofocus
